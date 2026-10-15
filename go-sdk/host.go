@@ -5,10 +5,12 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -308,7 +310,7 @@ func (d *Devbridge) startHostAcceptLoop(ctx context.Context, outerSession *ssh.C
 
 		switch channel.ChannelType {
 		case relayChannelType:
-			var stream *ssh.Stream
+			var stream io.ReadWriteCloser
 			if !pn.received.Load() {
 				// Treat the first relay channel as the gateway's port notification only when it
 				// parses as a RelayRequest; otherwise forward it as normal data.
@@ -338,22 +340,32 @@ func (d *Devbridge) startHostAcceptLoop(ctx context.Context, outerSession *ssh.C
 }
 
 // readPortNotification reports whether a relay channel is the gateway's port
-// notification. When isNotif is false it returns the stream already wrapping the
-// channel so the caller can forward any buffered bytes as data without losing them.
+// notification. When isNotif is false it returns a stream that replays the bytes
+// consumed by the probe before forwarding the remaining channel data.
 // When isNotif is true the notification has been consumed and the stream closed.
-func readPortNotification(channel *ssh.Channel) (stream *ssh.Stream, ports []int, isNotif bool) {
+func readPortNotification(channel *ssh.Channel) (stream io.ReadWriteCloser, ports []int, isNotif bool) {
 	stream = ssh.NewStream(channel)
 	buf := make([]byte, 4096)
 	n, err := stream.Read(buf)
-	if err != nil {
-		return stream, nil, false
+	if err == nil {
+		ports, isNotif = parsePortNotification(buf[:n])
 	}
-	ports, isNotif = parsePortNotification(buf[:n])
 	if isNotif {
 		_ = stream.Close()
 		return nil, ports, true
 	}
-	return stream, nil, false
+	return &replayStream{ReadWriteCloser: stream, reader: io.MultiReader(bytes.NewReader(buf[:n]), stream)}, nil, false
+}
+
+// replayStream preserves Write and Close on the original SSH stream while
+// returning the probe's consumed prefix exactly once to the inner SSH session.
+type replayStream struct {
+	io.ReadWriteCloser
+	reader io.Reader
+}
+
+func (s *replayStream) Read(p []byte) (int, error) {
+	return s.reader.Read(p)
 }
 
 // parsePortNotification returns the ports of a RelayRequest payload, or false when
@@ -373,7 +385,7 @@ func parsePortNotification(data []byte) ([]int, bool) {
 	return ports, true
 }
 
-func (d *Devbridge) handleRelayChannel(ctx context.Context, channel *ssh.Channel, stream *ssh.Stream, ports []int) {
+func (d *Devbridge) handleRelayChannel(ctx context.Context, channel *ssh.Channel, stream io.ReadWriteCloser, ports []int) {
 	innerConfig := ssh.NewNoSecurityConfig()
 	tcp.AddPortForwardingService(innerConfig)
 	innerSession := ssh.NewServerSession(innerConfig)
